@@ -1,12 +1,12 @@
 """
-Xtream Codes Client - PyQt5
-Connexion API Xtream, navigation Live/Films/Series, lecture VLC, export M3U.
+XtreamerPy - Client desktop Xtream Codes
+https://github.com/Edmondio/XtreamerPy
 
 Dependances :
     pip install PyQt5 requests urllib3
 
 Lancement :
-    python xtream_client.py
+    python xtreamerpy.py
 """
 
 import sys
@@ -15,6 +15,8 @@ import os
 import shutil
 import subprocess
 import platform
+import base64
+from datetime import datetime
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -25,11 +27,14 @@ from PyQt5.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTabWidget, QListWidget,
     QListWidgetItem, QSplitter, QMessageBox, QFileDialog, QDialog,
     QFormLayout, QCheckBox, QStatusBar, QProgressBar, QTextEdit, QComboBox,
-    QTreeWidget, QTreeWidgetItem, QMenu, QAction
+    QTreeWidget, QTreeWidgetItem, QMenu, QAction, QRadioButton, QButtonGroup,
+    QGroupBox, QDialogButtonBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
-CONFIG_FILE = os.path.expanduser("~/.xtream_client.json")
+APP_NAME = "XtreamerPy"
+APP_VERSION = "1.1.0"
+CONFIG_FILE = os.path.expanduser("~/.xtreamerpy.json")
 
 USER_AGENTS = {
     "VLC (recommande)":      "VLC/3.0.20 LibVLC/3.0.20",
@@ -40,42 +45,100 @@ USER_AGENTS = {
     "python-requests (debug)": None,
 }
 
+STAR_FILLED = "⭐"
+STAR_EMPTY = "☆"
+
+
+# ---------------------------------------------------------------------------
+# Config + Favoris
+# ---------------------------------------------------------------------------
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        print(f"Erreur sauvegarde config : {e}")
+
+
+class FavoritesManager:
+    """Gere les favoris persistants pour live/vod/series."""
+
+    def __init__(self):
+        cfg = load_config()
+        favs = cfg.get("favorites", {})
+        self.data = {
+            "live": favs.get("live", []),
+            "vod": favs.get("vod", []),
+            "series": favs.get("series", []),
+        }
+
+    def _key(self, item):
+        return item.get("stream_id") or item.get("series_id") or item.get("id")
+
+    def save(self):
+        cfg = load_config()
+        cfg["favorites"] = self.data
+        save_config(cfg)
+
+    def is_favorite(self, kind, item):
+        kid = self._key(item)
+        return any(self._key(f) == kid for f in self.data.get(kind, []))
+
+    def toggle(self, kind, item):
+        """Retourne True si maintenant en favoris, False sinon."""
+        kid = self._key(item)
+        if self.is_favorite(kind, item):
+            self.data[kind] = [f for f in self.data[kind] if self._key(f) != kid]
+            self.save()
+            return False
+        else:
+            # Stocker une copie reduite pour ne pas tout dupliquer
+            self.data[kind].append(dict(item))
+            self.save()
+            return True
+
+    def get_all(self, kind):
+        return list(self.data.get(kind, []))
+
+    def count(self, kind):
+        return len(self.data.get(kind, []))
+
 
 # ---------------------------------------------------------------------------
 # Detection VLC
 # ---------------------------------------------------------------------------
 def find_vlc():
-    """Cherche l'executable VLC. Retourne le chemin ou None."""
     system = platform.system()
-    candidates = []
     if system == "Windows":
         candidates = [
             r"C:\Program Files\VideoLAN\VLC\vlc.exe",
             r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
         ]
     elif system == "Darwin":
-        candidates = [
-            "/Applications/VLC.app/Contents/MacOS/VLC",
-        ]
-    else:  # Linux
+        candidates = ["/Applications/VLC.app/Contents/MacOS/VLC"]
+    else:
         candidates = ["/usr/bin/vlc", "/usr/local/bin/vlc", "/snap/bin/vlc"]
-
     for c in candidates:
         if os.path.isfile(c):
             return c
-    # Fallback PATH
-    found = shutil.which("vlc")
-    if found:
-        return found
-    return None
+    return shutil.which("vlc")
 
 
 def launch_vlc(vlc_path, url, user_agent=None, title=None):
-    """Lance VLC en non-bloquant avec l'URL fournie."""
     if not vlc_path or not os.path.isfile(vlc_path):
         raise RuntimeError(
             "VLC introuvable. Installe VLC ou configure son chemin "
-            "dans Parametres > Chemin VLC."
+            "via le bouton 'Chemin VLC'."
         )
     args = [vlc_path]
     if user_agent:
@@ -83,13 +146,40 @@ def launch_vlc(vlc_path, url, user_agent=None, title=None):
     if title:
         args.append(f"--meta-title={title}")
     args.append(url)
-    # Lancement detache pour ne pas bloquer / capturer stdout
     kwargs = {}
     if platform.system() == "Windows":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED_PROCESS
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008
     else:
         kwargs["start_new_session"] = True
     subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Helpers EPG
+# ---------------------------------------------------------------------------
+def decode_b64(s):
+    if not s:
+        return ""
+    try:
+        return base64.b64decode(s).decode("utf-8", errors="replace")
+    except Exception:
+        return s
+
+
+def format_epg_time(ts):
+    """Convertit un timestamp Xtream (str ou int) en heure lisible."""
+    if not ts:
+        return "?"
+    try:
+        if isinstance(ts, str) and "-" in ts:
+            # Format "YYYY-MM-DD HH:MM:SS"
+            dt = datetime.strptime(ts.split(" ")[0] + " " + ts.split(" ")[1],
+                                   "%Y-%m-%d %H:%M:%S")
+        else:
+            dt = datetime.fromtimestamp(int(ts))
+        return dt.strftime("%d/%m %H:%M")
+    except Exception:
+        return str(ts)
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +216,6 @@ class XtreamAPI:
             "Accept-Encoding": "gzip, deflate",
             "Connection": "keep-alive",
         })
-
         self.base = f"{self.host}/player_api.php"
 
     def _get(self, action=None, **params):
@@ -148,10 +237,7 @@ class XtreamAPI:
         except requests.exceptions.Timeout:
             raise RuntimeError("Le serveur ne repond pas (timeout 30s).")
         except requests.exceptions.SSLError as e:
-            raise RuntimeError(
-                "Erreur SSL. Decoche 'Verifier SSL' dans la fenetre de connexion.\n\n"
-                f"Detail : {e}"
-            )
+            raise RuntimeError(f"Erreur SSL. Decoche 'Verifier SSL'.\n\nDetail : {e}")
         r.raise_for_status()
         try:
             return r.json()
@@ -189,6 +275,9 @@ class XtreamAPI:
     def series_info(self, series_id):
         return self._get("get_series_info", series_id=series_id)
 
+    def short_epg(self, stream_id, limit=10):
+        return self._get("get_short_epg", stream_id=stream_id, limit=limit)
+
     def m3u_url(self, output="ts"):
         return (
             f"{self.host}/get.php?username={self.username}"
@@ -202,6 +291,39 @@ class XtreamAPI:
             return f"{self.host}/movie/{self.username}/{self.password}/{stream_id}.{ext}"
         elif kind == "series":
             return f"{self.host}/series/{self.username}/{self.password}/{stream_id}.{ext}"
+
+
+# ---------------------------------------------------------------------------
+# M3U Generation
+# ---------------------------------------------------------------------------
+def build_m3u(items, kind, api):
+    """Construit un M3U Plus a partir d'une liste d'items live ou vod."""
+    lines = ["#EXTM3U"]
+    for it in items:
+        sid = it.get("stream_id") or it.get("id")
+        if not sid:
+            continue
+        name = it.get("name") or it.get("title", "?")
+        tvg_id = it.get("epg_channel_id", "") or ""
+        tvg_logo = it.get("stream_icon", "") or ""
+        group = it.get("category_name", "") or ""
+        if kind == "live":
+            ext = "ts"
+            url = api.stream_url(sid, "live", ext)
+        else:
+            ext = it.get("container_extension", "mp4")
+            url = api.stream_url(sid, "movie", ext)
+        # Escaper les guillemets dans les attributs
+        safe_name = str(name).replace('"', "'")
+        safe_logo = str(tvg_logo).replace('"', "'")
+        safe_group = str(group).replace('"', "'")
+        safe_tvg = str(tvg_id).replace('"', "'")
+        lines.append(
+            f'#EXTINF:-1 tvg-id="{safe_tvg}" tvg-name="{safe_name}" '
+            f'tvg-logo="{safe_logo}" group-title="{safe_group}",{safe_name}'
+        )
+        lines.append(url)
+    return "\n".join(lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -256,12 +378,68 @@ class M3UDownloadThread(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Dialog Export M3U
+# ---------------------------------------------------------------------------
+class M3UExportDialog(QDialog):
+    """Choix du mode d'export M3U."""
+
+    MODE_FULL_SERVER = "full_server"
+    MODE_FAVORITES = "favorites"
+    MODE_CATEGORY = "category"
+
+    def __init__(self, favorites_count, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Exporter en M3U")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("<b>Choisis ce que tu veux exporter :</b>"))
+
+        self.group = QButtonGroup(self)
+
+        self.rb_full = QRadioButton("📦  M3U complet du serveur (tout)")
+        self.rb_full.setChecked(True)
+        layout.addWidget(self.rb_full)
+        layout.addWidget(QLabel(
+            "<i style='color:#666;'>Telecharge le fichier directement depuis le serveur "
+            "(chaines + films + series).</i>"
+        ))
+
+        fav_count_live = favorites_count.get("live", 0)
+        fav_count_vod = favorites_count.get("vod", 0)
+        total_favs = fav_count_live + fav_count_vod
+
+        self.rb_favs = QRadioButton(
+            f"⭐  Favoris uniquement ({fav_count_live} chaines + {fav_count_vod} films)"
+        )
+        self.rb_favs.setEnabled(total_favs > 0)
+        layout.addWidget(self.rb_favs)
+        layout.addWidget(QLabel(
+            "<i style='color:#666;'>Genere localement un M3U avec tes favoris Live + Films. "
+            "Les series ne sont pas incluses (multi-episodes).</i>"
+        ))
+
+        self.group.addButton(self.rb_full)
+        self.group.addButton(self.rb_favs)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def selected_mode(self):
+        if self.rb_favs.isChecked():
+            return self.MODE_FAVORITES
+        return self.MODE_FULL_SERVER
+
+
+# ---------------------------------------------------------------------------
 # Login
 # ---------------------------------------------------------------------------
 class LoginDialog(QDialog):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Connexion Xtream Codes")
+        self.setWindowTitle(f"{APP_NAME} - Connexion")
         self.setMinimumWidth(520)
 
         layout = QFormLayout(self)
@@ -275,7 +453,6 @@ class LoginDialog(QDialog):
         for label in USER_AGENTS.keys():
             self.ua_combo.addItem(label)
 
-        # Chemin VLC
         vlc_row = QHBoxLayout()
         self.vlc_input = QLineEdit()
         self.vlc_input.setPlaceholderText("Auto-detecte au demarrage")
@@ -298,7 +475,6 @@ class LoginDialog(QDialog):
         layout.addRow("", self.verify_ssl)
         layout.addRow("", self.remember)
 
-        # Auto-detect VLC
         detected = find_vlc()
         if detected:
             self.vlc_input.setText(detected)
@@ -313,29 +489,22 @@ class LoginDialog(QDialog):
         btns.addWidget(self.connect_btn)
         layout.addRow(btns)
 
-        # Charger config
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE) as f:
-                    cfg = json.load(f)
-                self.host_input.setText(cfg.get("host", ""))
-                self.user_input.setText(cfg.get("username", ""))
-                self.pass_input.setText(cfg.get("password", ""))
-                ua_label = cfg.get("user_agent_label")
-                if ua_label and ua_label in USER_AGENTS:
-                    self.ua_combo.setCurrentText(ua_label)
-                self.verify_ssl.setChecked(cfg.get("verify_ssl", True))
-                if cfg.get("vlc_path"):
-                    self.vlc_input.setText(cfg["vlc_path"])
+        cfg = load_config()
+        if cfg:
+            self.host_input.setText(cfg.get("host", ""))
+            self.user_input.setText(cfg.get("username", ""))
+            self.pass_input.setText(cfg.get("password", ""))
+            ua_label = cfg.get("user_agent_label")
+            if ua_label and ua_label in USER_AGENTS:
+                self.ua_combo.setCurrentText(ua_label)
+            self.verify_ssl.setChecked(cfg.get("verify_ssl", True))
+            if cfg.get("vlc_path"):
+                self.vlc_input.setText(cfg["vlc_path"])
+            if cfg.get("host"):
                 self.remember.setChecked(True)
-            except Exception:
-                pass
 
     def _browse_vlc(self):
-        if platform.system() == "Windows":
-            ext = "vlc.exe (vlc.exe)"
-        else:
-            ext = "Tous les fichiers (*)"
+        ext = "vlc.exe (vlc.exe)" if platform.system() == "Windows" else "Tous (*)"
         path, _ = QFileDialog.getOpenFileName(self, "Selectionner VLC", "", ext)
         if path:
             self.vlc_input.setText(path)
@@ -355,7 +524,7 @@ class LoginDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Fenetre series (saisons + episodes)
+# Series Dialog
 # ---------------------------------------------------------------------------
 class SeriesDetailsDialog(QDialog):
     def __init__(self, api, vlc_path, series_data, parent=None):
@@ -364,10 +533,9 @@ class SeriesDetailsDialog(QDialog):
         self.vlc_path = vlc_path
         self.series_data = series_data
         self.setWindowTitle(f"Serie : {series_data.get('name', '?')}")
-        self.resize(700, 600)
+        self.resize(750, 600)
 
         layout = QVBoxLayout(self)
-
         title = QLabel(f"<h2>{series_data.get('name', '?')}</h2>")
         layout.addWidget(title)
 
@@ -387,10 +555,9 @@ class SeriesDetailsDialog(QDialog):
             layout.addWidget(plot)
 
         layout.addWidget(QLabel("<b>Saisons & Episodes :</b>"))
-
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["Titre", "Duree", "Note"])
-        self.tree.setColumnWidth(0, 400)
+        self.tree.setColumnWidth(0, 420)
         self.tree.itemDoubleClicked.connect(self.on_double_click)
         layout.addWidget(self.tree)
 
@@ -407,7 +574,6 @@ class SeriesDetailsDialog(QDialog):
 
         self.tree.itemSelectionChanged.connect(self._on_select)
 
-        # Chargement async
         self.tree.addTopLevelItem(QTreeWidgetItem(["Chargement..."]))
         self.thread = LoaderThread(self.api.series_info, series_data.get("series_id"))
         self.thread.finished_ok.connect(self._on_loaded)
@@ -424,17 +590,16 @@ class SeriesDetailsDialog(QDialog):
         if not episodes:
             self.tree.addTopLevelItem(QTreeWidgetItem(["Aucun episode trouve"]))
             return
-        # episodes est un dict { "1": [...], "2": [...] } par saison
-        for season_num in sorted(episodes.keys(), key=lambda x: int(x) if str(x).isdigit() else 0):
+        for season_num in sorted(episodes.keys(),
+                                  key=lambda x: int(x) if str(x).isdigit() else 0):
             season_eps = episodes[season_num]
             season_item = QTreeWidgetItem([f"Saison {season_num}  ({len(season_eps)} episodes)"])
             self.tree.addTopLevelItem(season_item)
             for ep in season_eps:
                 title = ep.get("title") or f"Episode {ep.get('episode_num', '?')}"
                 info_ep = ep.get("info", {}) or {}
-                duration = info_ep.get("duration", "")
-                rating = info_ep.get("rating", "")
-                ep_item = QTreeWidgetItem([title, str(duration), str(rating)])
+                ep_item = QTreeWidgetItem([title, str(info_ep.get("duration", "")),
+                                            str(info_ep.get("rating", ""))])
                 ep_item.setData(0, Qt.UserRole, ep)
                 season_item.addChild(ep_item)
             season_item.setExpanded(True)
@@ -445,21 +610,17 @@ class SeriesDetailsDialog(QDialog):
 
     def _play_episode(self, ep):
         ext = ep.get("container_extension", "mkv")
-        ep_id = ep.get("id")
-        url = self.api.stream_url(ep_id, "series", ext)
-        title = ep.get("title", "Episode")
+        url = self.api.stream_url(ep.get("id"), "series", ext)
         try:
-            launch_vlc(self.vlc_path, url, user_agent=self.api.user_agent, title=title)
+            launch_vlc(self.vlc_path, url, user_agent=self.api.user_agent,
+                       title=ep.get("title", "Episode"))
         except Exception as e:
             QMessageBox.warning(self, "Erreur VLC", str(e))
 
     def play_selected(self):
         items = self.tree.selectedItems()
-        if not items:
-            return
-        ep = items[0].data(0, Qt.UserRole)
-        if ep:
-            self._play_episode(ep)
+        if items and items[0].data(0, Qt.UserRole):
+            self._play_episode(items[0].data(0, Qt.UserRole))
 
     def on_double_click(self, item, _column):
         ep = item.data(0, Qt.UserRole)
@@ -471,13 +632,20 @@ class SeriesDetailsDialog(QDialog):
 # Onglet generique
 # ---------------------------------------------------------------------------
 class BrowseTab(QWidget):
-    def __init__(self, api, kind, get_vlc_path):
+    """Onglet Live/VOD/Series avec favoris, EPG (live), recherche."""
+
+    favorites_changed = pyqtSignal()  # pour rafraichir le compteur global
+
+    def __init__(self, api, kind, favorites, get_vlc_path):
         super().__init__()
         self.api = api
         self.kind = kind
-        self.get_vlc_path = get_vlc_path  # callback pour avoir le chemin VLC a jour
+        self.favorites = favorites
+        self.get_vlc_path = get_vlc_path
         self.all_items = []
         self.current_data = None
+        self.current_category_id = None
+        self.epg_thread = None
 
         root = QVBoxLayout(self)
 
@@ -501,33 +669,48 @@ class BrowseTab(QWidget):
         self.item_list.customContextMenuRequested.connect(self._show_context_menu)
         splitter.addWidget(self.item_list)
 
-        # Panneau droit : details + boutons
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
+
         self.details = QTextEdit()
         self.details.setReadOnly(True)
-        right_layout.addWidget(self.details)
+        right_layout.addWidget(self.details, stretch=2)
+
+        if self.kind == "live":
+            epg_label = QLabel("<b>📅 Guide TV (EPG) :</b>")
+            right_layout.addWidget(epg_label)
+            self.epg_view = QTextEdit()
+            self.epg_view.setReadOnly(True)
+            self.epg_view.setMaximumHeight(180)
+            right_layout.addWidget(self.epg_view, stretch=1)
+        else:
+            self.epg_view = None
 
         self.play_btn = QPushButton("▶️  Lire avec VLC")
         self.play_btn.clicked.connect(self.play_current)
         self.play_btn.setEnabled(False)
         self.play_btn.setStyleSheet(
-            "QPushButton { padding: 8px; font-weight: bold; background: #ff6b35; color: white; border-radius: 4px; }"
+            "QPushButton { padding: 8px; font-weight: bold; background: #ff6b35;"
+            " color: white; border-radius: 4px; }"
             "QPushButton:disabled { background: #ccc; }"
             "QPushButton:hover:!disabled { background: #ff8555; }"
         )
         right_layout.addWidget(self.play_btn)
+
+        self.fav_btn = QPushButton(f"{STAR_EMPTY}  Ajouter aux favoris")
+        self.fav_btn.clicked.connect(self.toggle_favorite)
+        self.fav_btn.setEnabled(False)
+        right_layout.addWidget(self.fav_btn)
 
         self.copy_url_btn = QPushButton("📋  Copier URL")
         self.copy_url_btn.clicked.connect(self.copy_current_url)
         self.copy_url_btn.setEnabled(False)
         right_layout.addWidget(self.copy_url_btn)
 
-        right_panel.setMaximumWidth(380)
+        right_panel.setMaximumWidth(420)
         splitter.addWidget(right_panel)
-
-        splitter.setSizes([250, 500, 350])
+        splitter.setSizes([250, 500, 400])
         root.addWidget(splitter)
 
         self.count_label = QLabel("")
@@ -535,7 +718,9 @@ class BrowseTab(QWidget):
 
         self.load_categories()
 
+    # ----- Chargement -----
     def load_categories(self):
+        self.cat_list.clear()
         self.cat_list.addItem("Chargement...")
         getter = {
             "live": self.api.live_categories,
@@ -549,13 +734,29 @@ class BrowseTab(QWidget):
 
     def _on_categories_loaded(self, cats):
         self.cat_list.clear()
+        # Categorie speciale Favoris en haut
+        fav_count = self.favorites.count(self.kind)
+        fav_item = QListWidgetItem(f"⭐ Favoris ({fav_count})")
+        fav_item.setData(Qt.UserRole, "__favorites__")
+        self.cat_list.addItem(fav_item)
+
         all_item = QListWidgetItem("📂 Tout")
         all_item.setData(Qt.UserRole, None)
         self.cat_list.addItem(all_item)
+
         for c in cats or []:
             item = QListWidgetItem(c.get("category_name", "?"))
             item.setData(Qt.UserRole, c.get("category_id"))
             self.cat_list.addItem(item)
+
+    def refresh_favorites_category(self):
+        """Met a jour le compteur de la categorie favoris."""
+        if self.cat_list.count() == 0:
+            return
+        first = self.cat_list.item(0)
+        if first and first.data(Qt.UserRole) == "__favorites__":
+            fav_count = self.favorites.count(self.kind)
+            first.setText(f"⭐ Favoris ({fav_count})")
 
     def _on_error(self, msg):
         self.cat_list.clear()
@@ -563,7 +764,16 @@ class BrowseTab(QWidget):
         QMessageBox.warning(self, "Erreur", msg)
 
     def on_category_clicked(self, item):
-        cat_id = item.data(Qt.UserRole)
+        cat_data = item.data(Qt.UserRole)
+        self.current_category_id = cat_data
+
+        if cat_data == "__favorites__":
+            # Afficher uniquement les favoris
+            favs = self.favorites.get_all(self.kind)
+            self.all_items = favs
+            self.render_items(favs)
+            return
+
         self.item_list.clear()
         self.item_list.addItem("Chargement...")
         getter = {
@@ -571,7 +781,7 @@ class BrowseTab(QWidget):
             "vod": self.api.vod_streams,
             "series": self.api.series,
         }[self.kind]
-        self.item_thread = LoaderThread(getter, cat_id)
+        self.item_thread = LoaderThread(getter, cat_data)
         self.item_thread.finished_ok.connect(self._on_items_loaded)
         self.item_thread.failed.connect(self._on_error)
         self.item_thread.start()
@@ -580,11 +790,16 @@ class BrowseTab(QWidget):
         self.all_items = items or []
         self.render_items(self.all_items)
 
+    def _format_item_label(self, it):
+        name = it.get("name") or it.get("title") or "?"
+        if self.favorites.is_favorite(self.kind, it):
+            return f"{STAR_FILLED}  {name}"
+        return name
+
     def render_items(self, items):
         self.item_list.clear()
         for it in items:
-            name = it.get("name") or it.get("title") or "?"
-            qitem = QListWidgetItem(name)
+            qitem = QListWidgetItem(self._format_item_label(it))
             qitem.setData(Qt.UserRole, it)
             self.item_list.addItem(qitem)
         self.count_label.setText(f"{len(items)} elements")
@@ -600,8 +815,8 @@ class BrowseTab(QWidget):
         ]
         self.render_items(filtered)
 
+    # ----- Selection -----
     def _url_for(self, data):
-        """Retourne (url, label_action) pour l'item. Pour series, pas d'URL directe."""
         sid = data.get("stream_id") or data.get("series_id")
         if not sid:
             return None
@@ -611,7 +826,7 @@ class BrowseTab(QWidget):
         elif self.kind == "vod":
             ext = data.get("container_extension", "mp4")
             return self.api.stream_url(sid, "movie", ext)
-        return None  # series : pas d'URL directe
+        return None
 
     def on_item_clicked(self, item):
         data = item.data(Qt.UserRole)
@@ -621,10 +836,8 @@ class BrowseTab(QWidget):
         url = self._url_for(data)
         sid = data.get("stream_id") or data.get("series_id")
 
-        if self.kind == "series":
-            url_display = "Multi-episodes (bouton Lire ouvre les saisons)"
-        else:
-            url_display = url or "(URL indisponible)"
+        url_display = ("Multi-episodes (bouton Lire ouvre les saisons)"
+                       if self.kind == "series" else (url or "(URL indisponible)"))
 
         info_lines = [
             f"<b>Nom :</b> {data.get('name') or data.get('title')}",
@@ -641,7 +854,7 @@ class BrowseTab(QWidget):
             info_lines.append(f"<b>Sortie :</b> {data.get('releaseDate') or data.get('release_date')}")
         self.details.setHtml("<br>".join(info_lines))
 
-        # Activer les boutons
+        # Boutons
         if self.kind == "series":
             self.play_btn.setText("📼  Voir saisons & episodes")
             self.play_btn.setEnabled(True)
@@ -650,6 +863,51 @@ class BrowseTab(QWidget):
             self.play_btn.setText("▶️  Lire avec VLC")
             self.play_btn.setEnabled(bool(url))
             self.copy_url_btn.setEnabled(bool(url))
+
+        # Favoris button
+        if self.favorites.is_favorite(self.kind, data):
+            self.fav_btn.setText(f"{STAR_FILLED}  Retirer des favoris")
+        else:
+            self.fav_btn.setText(f"{STAR_EMPTY}  Ajouter aux favoris")
+        self.fav_btn.setEnabled(True)
+
+        # EPG pour live
+        if self.kind == "live" and self.epg_view is not None:
+            self._load_epg(sid)
+
+    def _load_epg(self, stream_id):
+        if not stream_id:
+            return
+        self.epg_view.setHtml("<i>Chargement du guide TV...</i>")
+        if self.epg_thread and self.epg_thread.isRunning():
+            self.epg_thread.terminate()
+        self.epg_thread = LoaderThread(self.api.short_epg, stream_id, 8)
+        self.epg_thread.finished_ok.connect(self._on_epg_loaded)
+        self.epg_thread.failed.connect(
+            lambda m: self.epg_view.setHtml(f"<i style='color:#a00;'>EPG indisponible : {m}</i>")
+        )
+        self.epg_thread.start()
+
+    def _on_epg_loaded(self, data):
+        listings = data.get("epg_listings", []) if data else []
+        if not listings:
+            self.epg_view.setHtml("<i>Aucun programme disponible.</i>")
+            return
+        rows = []
+        for prog in listings:
+            title = decode_b64(prog.get("title", "")) or "(sans titre)"
+            desc = decode_b64(prog.get("description", "") or "")
+            start = format_epg_time(prog.get("start"))
+            end = format_epg_time(prog.get("end"))
+            now_flag = " 🔴 EN COURS" if str(prog.get("now_playing", "")) == "1" else ""
+            rows.append(
+                f"<div style='margin-bottom:8px;'>"
+                f"<b>{start} → {end}{now_flag}</b><br>"
+                f"<span style='color:#000;'>{title}</span>"
+                f"{f'<br><span style=\"color:#666; font-size:11px;\">{desc}</span>' if desc else ''}"
+                f"</div>"
+            )
+        self.epg_view.setHtml("".join(rows))
 
     def on_item_double_clicked(self, item):
         data = item.data(Qt.UserRole)
@@ -667,7 +925,7 @@ class BrowseTab(QWidget):
             return
         url = self._url_for(self.current_data)
         if not url:
-            QMessageBox.warning(self, "Erreur", "URL indisponible pour cet element")
+            QMessageBox.warning(self, "Erreur", "URL indisponible")
             return
         title = self.current_data.get("name") or self.current_data.get("title", "Stream")
         try:
@@ -682,6 +940,22 @@ class BrowseTab(QWidget):
         if url:
             QApplication.clipboard().setText(url)
 
+    def toggle_favorite(self):
+        if not self.current_data:
+            return
+        is_now_fav = self.favorites.toggle(self.kind, self.current_data)
+        if is_now_fav:
+            self.fav_btn.setText(f"{STAR_FILLED}  Retirer des favoris")
+        else:
+            self.fav_btn.setText(f"{STAR_EMPTY}  Ajouter aux favoris")
+        # Rafraichir la liste pour mettre a jour l'etoile
+        # Si on est sur "Favoris" et qu'on retire, l'item disparait
+        if self.current_category_id == "__favorites__":
+            self.all_items = self.favorites.get_all(self.kind)
+        self.render_items(self.all_items)
+        self.refresh_favorites_category()
+        self.favorites_changed.emit()
+
     def _show_context_menu(self, pos):
         item = self.item_list.itemAt(pos)
         if not item:
@@ -691,16 +965,28 @@ class BrowseTab(QWidget):
             return
         self.current_data = data
         menu = QMenu(self)
+
         if self.kind == "series":
             act = QAction("📼  Voir saisons & episodes", self)
         else:
             act = QAction("▶️  Lire avec VLC", self)
         act.triggered.connect(self.play_current)
         menu.addAction(act)
+
         if self.kind != "series":
             copy_act = QAction("📋  Copier l'URL", self)
             copy_act.triggered.connect(self.copy_current_url)
             menu.addAction(copy_act)
+
+        menu.addSeparator()
+        is_fav = self.favorites.is_favorite(self.kind, data)
+        fav_act = QAction(
+            f"{STAR_FILLED}  Retirer des favoris" if is_fav else f"{STAR_EMPTY}  Ajouter aux favoris",
+            self
+        )
+        fav_act.triggered.connect(self.toggle_favorite)
+        menu.addAction(fav_act)
+
         menu.exec_(self.item_list.mapToGlobal(pos))
 
 
@@ -712,8 +998,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.api = api
         self.vlc_path = vlc_path
-        self.setWindowTitle("Xtream Codes Client")
-        self.resize(1300, 800)
+        self.favorites = FavoritesManager()
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.resize(1320, 820)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -724,32 +1011,42 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.account_label)
 
         actions = QHBoxLayout()
-        self.dl_btn = QPushButton("⬇️  Telecharger le M3U")
-        self.dl_btn.clicked.connect(self.download_m3u)
+        self.export_btn = QPushButton("⬇️  Exporter M3U...")
+        self.export_btn.clicked.connect(self.export_m3u)
         self.copy_btn = QPushButton("📋  Copier URL M3U")
         self.copy_btn.clicked.connect(self.copy_m3u_url)
         self.refresh_btn = QPushButton("🔄  Rafraichir compte")
         self.refresh_btn.clicked.connect(self.load_account_info)
         self.vlc_btn = QPushButton("⚙️  Chemin VLC")
         self.vlc_btn.clicked.connect(self.change_vlc_path)
-        actions.addWidget(self.dl_btn)
+        actions.addWidget(self.export_btn)
         actions.addWidget(self.copy_btn)
         actions.addWidget(self.refresh_btn)
         actions.addWidget(self.vlc_btn)
         actions.addStretch()
         self.vlc_status = QLabel()
+        self.fav_status = QLabel()
+        actions.addWidget(self.fav_status)
+        actions.addWidget(QLabel(" | "))
         actions.addWidget(self.vlc_status)
         layout.addLayout(actions)
         self._update_vlc_status()
+        self._update_fav_status()
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(BrowseTab(api, "live", lambda: self.vlc_path), "📺 Chaines Live")
-        self.tabs.addTab(BrowseTab(api, "vod", lambda: self.vlc_path), "🎬 Films")
-        self.tabs.addTab(BrowseTab(api, "series", lambda: self.vlc_path), "📼 Series")
+        self.live_tab = BrowseTab(api, "live", self.favorites, lambda: self.vlc_path)
+        self.vod_tab = BrowseTab(api, "vod", self.favorites, lambda: self.vlc_path)
+        self.series_tab = BrowseTab(api, "series", self.favorites, lambda: self.vlc_path)
+        for tab in (self.live_tab, self.vod_tab, self.series_tab):
+            tab.favorites_changed.connect(self._update_fav_status)
+        self.tabs.addTab(self.live_tab, "📺 Chaines Live")
+        self.tabs.addTab(self.vod_tab, "🎬 Films")
+        self.tabs.addTab(self.series_tab, "📼 Series")
         layout.addWidget(self.tabs)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+        self.status.showMessage(f"Bienvenue dans {APP_NAME} !", 5000)
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         self.progress.setMaximumWidth(200)
@@ -765,26 +1062,22 @@ class MainWindow(QMainWindow):
             self.vlc_status.setText("VLC : ❌ non configure")
             self.vlc_status.setStyleSheet("color: red;")
 
+    def _update_fav_status(self):
+        n = (self.favorites.count("live") +
+             self.favorites.count("vod") +
+             self.favorites.count("series"))
+        self.fav_status.setText(f"⭐ {n} favoris")
+        self.fav_status.setStyleSheet("color: #d4a017;")
+
     def change_vlc_path(self):
-        if platform.system() == "Windows":
-            ext = "vlc.exe (vlc.exe)"
-        else:
-            ext = "Tous les fichiers (*)"
+        ext = "vlc.exe (vlc.exe)" if platform.system() == "Windows" else "Tous (*)"
         path, _ = QFileDialog.getOpenFileName(self, "Selectionner VLC", "", ext)
         if path:
             self.vlc_path = path
             self._update_vlc_status()
-            # Sauvegarder dans config
-            try:
-                cfg = {}
-                if os.path.exists(CONFIG_FILE):
-                    with open(CONFIG_FILE) as f:
-                        cfg = json.load(f)
-                cfg["vlc_path"] = path
-                with open(CONFIG_FILE, "w") as f:
-                    json.dump(cfg, f)
-            except Exception:
-                pass
+            cfg = load_config()
+            cfg["vlc_path"] = path
+            save_config(cfg)
 
     def load_account_info(self):
         self.account_label.setText("Chargement du compte...")
@@ -799,7 +1092,6 @@ class MainWindow(QMainWindow):
         status = u.get("status", "?")
         exp = u.get("exp_date")
         if exp:
-            from datetime import datetime
             try:
                 exp_str = datetime.fromtimestamp(int(exp)).strftime("%Y-%m-%d %H:%M")
             except Exception:
@@ -811,8 +1103,7 @@ class MainWindow(QMainWindow):
             f"<b>Statut :</b> {status} &nbsp;|&nbsp; "
             f"<b>Expire :</b> {exp_str} &nbsp;|&nbsp; "
             f"<b>Connexions :</b> {connections} &nbsp;|&nbsp; "
-            f"<b>Serveur :</b> {s.get('url', '?')}:{s.get('port', '?')} &nbsp;|&nbsp; "
-            f"<b>TZ :</b> {s.get('timezone', '?')}"
+            f"<b>Serveur :</b> {s.get('url', '?')}:{s.get('port', '?')}"
         )
         self.account_label.setText(msg)
 
@@ -820,15 +1111,31 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText(self.api.m3u_url())
         self.status.showMessage("URL M3U copiee dans le presse-papier", 4000)
 
-    def download_m3u(self):
+    def export_m3u(self):
+        counts = {
+            "live": self.favorites.count("live"),
+            "vod": self.favorites.count("vod"),
+        }
+        dlg = M3UExportDialog(counts, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        mode = dlg.selected_mode()
+
+        if mode == M3UExportDialog.MODE_FULL_SERVER:
+            self._download_full_m3u()
+        elif mode == M3UExportDialog.MODE_FAVORITES:
+            self._export_favorites_m3u()
+
+    def _download_full_m3u(self):
         path, _ = QFileDialog.getSaveFileName(
-            self, "Enregistrer le M3U", "playlist.m3u", "Fichiers M3U (*.m3u *.m3u8)"
+            self, "Enregistrer le M3U complet", "playlist_full.m3u",
+            "Fichiers M3U (*.m3u *.m3u8)"
         )
         if not path:
             return
         self.progress.setVisible(True)
         self.progress.setValue(0)
-        self.dl_btn.setEnabled(False)
+        self.export_btn.setEnabled(False)
         self.status.showMessage("Telechargement du M3U en cours...")
 
         self.dl_thread = M3UDownloadThread(
@@ -839,15 +1146,46 @@ class MainWindow(QMainWindow):
         self.dl_thread.failed.connect(self._on_dl_fail)
         self.dl_thread.start()
 
+    def _export_favorites_m3u(self):
+        live_favs = self.favorites.get_all("live")
+        vod_favs = self.favorites.get_all("vod")
+        if not live_favs and not vod_favs:
+            QMessageBox.information(self, "Favoris vides",
+                                     "Aucun favori a exporter (live ou films).")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Enregistrer le M3U des favoris", "playlist_favoris.m3u",
+            "Fichiers M3U (*.m3u *.m3u8)"
+        )
+        if not path:
+            return
+        try:
+            content = "#EXTM3U\n"
+            if live_favs:
+                content += build_m3u(live_favs, "live", self.api).replace("#EXTM3U\n", "", 1)
+            if vod_favs:
+                content += build_m3u(vod_favs, "vod", self.api).replace("#EXTM3U\n", "", 1)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            n = len(live_favs) + len(vod_favs)
+            QMessageBox.information(
+                self, "Export reussi",
+                f"{n} favoris exportes vers :\n{path}"
+            )
+            self.status.showMessage(f"Favoris exportes : {path}", 8000)
+        except Exception as e:
+            QMessageBox.warning(self, "Erreur export", str(e))
+
     def _on_dl_ok(self, path):
         self.progress.setVisible(False)
-        self.dl_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
         self.status.showMessage(f"M3U enregistre : {path}", 8000)
-        QMessageBox.information(self, "Telechargement termine", f"Fichier enregistre :\n{path}")
+        QMessageBox.information(self, "Telechargement termine",
+                                 f"Fichier enregistre :\n{path}")
 
     def _on_dl_fail(self, msg):
         self.progress.setVisible(False)
-        self.dl_btn.setEnabled(True)
+        self.export_btn.setEnabled(True)
         self.status.showMessage("Echec du telechargement", 5000)
         QMessageBox.warning(self, "Erreur", msg)
 
@@ -857,6 +1195,7 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 def main():
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
 
     while True:
@@ -878,24 +1217,28 @@ def main():
             if not info or "user_info" not in info:
                 raise RuntimeError("Reponse invalide")
             if info.get("user_info", {}).get("auth") == 0:
-                raise RuntimeError("Identifiants refuses par le serveur (auth=0)")
+                raise RuntimeError("Identifiants refuses (auth=0)")
         except Exception as e:
             QMessageBox.critical(None, "Connexion echouee", str(e))
             continue
 
         if creds["remember"]:
-            try:
-                with open(CONFIG_FILE, "w") as f:
-                    json.dump({
-                        "host": creds["host"],
-                        "username": creds["username"],
-                        "password": creds["password"],
-                        "user_agent_label": creds["user_agent_label"],
-                        "verify_ssl": creds["verify_ssl"],
-                        "vlc_path": creds["vlc_path"],
-                    }, f)
-            except Exception:
-                pass
+            cfg = load_config()
+            cfg.update({
+                "host": creds["host"],
+                "username": creds["username"],
+                "password": creds["password"],
+                "user_agent_label": creds["user_agent_label"],
+                "verify_ssl": creds["verify_ssl"],
+                "vlc_path": creds["vlc_path"],
+            })
+            save_config(cfg)
+        else:
+            # Si on decoche, on retire les creds mais on garde favoris + vlc_path
+            cfg = load_config()
+            for k in ("host", "username", "password", "user_agent_label", "verify_ssl"):
+                cfg.pop(k, None)
+            save_config(cfg)
 
         win = MainWindow(api, creds["vlc_path"])
         win.show()
